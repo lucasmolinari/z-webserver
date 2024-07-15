@@ -7,6 +7,42 @@ const StringHashmap = std.StringHashMap;
 
 const printd = std.debug.print;
 
+const Method = enum {
+    GET,
+    POST,
+    PUT,
+    PATCH,
+    DELETE,
+    HEAD,
+    OPTIONS,
+};
+
+const Header = struct {
+    method: Method,
+    uri: []const u8,
+    version: []const u8,
+    options: ?StringHashmap([]const u8),
+
+    fn print_debug(self: *Header) void {
+        printd("Method: {s}\nURI: {s}\nVersion: {s}\n", .{ @tagName(self.method), self.uri, self.version });
+        if (self.options != null) {
+            var opts_iter = self.options.?.iterator();
+            printd("Options:\n", .{});
+            while (opts_iter.next()) |entry| {
+                printd("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+        } else {
+            printd("No options set.", .{});
+        }
+    }
+
+    fn deinit(self: *Header) void {
+        if (self.options != null) {
+            self.options.?.deinit();
+        }
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -18,44 +54,60 @@ pub fn main() !void {
 
     while (true) {
         const conn = try listener.accept();
-        log.info("Connection established with: {any}", .{conn.address});
+        log.info("[Connection established with: {any}]", .{conn.address});
 
-        _ = try conn.stream.write("Hello, world!");
-        try parse_req(allocator, conn.stream);
+        var header = parse_header(allocator, conn.stream) catch |err| {
+            switch (err) {
+                error.UnknownMethod => {
+                    log.info("Unknown Method in Request", .{});
+                    continue;
+                },
+                error.InvalidHeader => {
+                    log.info("Invalid Headers in Request", .{});
+                    continue;
+                },
+                else => return err,
+            }
+        };
+        header.print_debug();
+        defer {
+            log.info("[Connection closed with: {any}]\n", .{conn.address});
+            conn.stream.close();
+            header.deinit();
+        }
     }
 }
 
-fn parse_req(allocator: std.mem.Allocator, stream: net.Stream) !void {
-    defer stream.close();
-
+fn parse_header(allocator: std.mem.Allocator, stream: net.Stream) !Header {
     const reader = stream.reader();
-    var array_list = std.ArrayList(u8).init(allocator);
-    defer array_list.deinit();
 
-    try reader.readAllArrayList(&array_list, std.math.maxInt(usize));
+    const first_line = try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', std.math.maxInt(usize));
+    var iter = std.mem.splitAny(u8, first_line.?, "\n");
 
-    var iter = std.mem.splitAny(u8, array_list.items, "\n");
+    var words = std.mem.splitAny(u8, iter.next().?, " ");
 
-    var first_line = std.mem.splitAny(u8, iter.next().?, " ");
-
-    const method = first_line.next().?;
-    const uri = first_line.next().?;
-    const version = first_line.next().?;
-    printd("Method: {s}\nURI: {s}\nVersion: {s}\n", .{ method, uri, version });
+    const method = std.meta.stringToEnum(Method, words.next().?) orelse return error.UnknownMethod;
+    const uri = words.next() orelse return error.InvalidHeader;
+    const version = words.next() orelse return error.InvalidHeader;
 
     var opts = StringHashmap([]const u8).init(allocator);
-    while (iter.next()) |line| {
+
+    while (true) {
+        const line = try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', std.math.maxInt(usize)) orelse break;
         if (line.len == 1 and std.mem.eql(u8, line, "\r")) break;
         var option = std.mem.splitAny(u8, line, ":");
-        const key = option.next().?;
-        var value = option.next().?;
+        const key = option.next() orelse break;
+        var value = option.next() orelse break;
         if (value[0] == ' ') value = value[1..];
-
         try opts.put(key, value);
     }
 
-    var opts_iter = opts.iterator();
-    while (opts_iter.next()) |entry| {
-        printd("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-    }
+    const options = if (opts.count() == 0) null else opts;
+
+    return Header{
+        .method = method,
+        .uri = uri,
+        .version = version,
+        .options = options,
+    };
 }
